@@ -7,7 +7,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from detectors.yolo_v8 import YOLOv8Detector
-from core.region_timer import RegionStayTimer
+from region_timer import RegionStayTimer
 from shapely.geometry import Point, Polygon
 import json
 import supervision as sv 
