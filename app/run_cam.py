@@ -1,14 +1,16 @@
 import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 import cv2
 import numpy as np
-from detectors.yolo_v8 import YOLOv8Detector
 
+# Add the project root directory to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+from detectors.yolo_v8 import YOLOv8Detector
 from core.region_timer import RegionStayTimer
 from shapely.geometry import Point, Polygon
 import json
-import supervision as sv  # pip install supervision
+import supervision as sv 
 
 # Sarı yol poligonunu dosyadan yükle
 with open("app/path_polygon.json", "r") as f:
@@ -16,7 +18,7 @@ with open("app/path_polygon.json", "r") as f:
 path_poly = Polygon(path_coords)
 
 timer = RegionStayTimer()
-VIOL_THRESH = 1.0  # saniye
+VIOL_THRESH = 5.0  # saniye
 
 def main():
     det = YOLOv8Detector()
