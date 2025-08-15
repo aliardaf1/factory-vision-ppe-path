@@ -4,6 +4,8 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 import cv2, json, time, os, sys
 import numpy as np
+import supervision as sv
+from shapely.geometry import Point
 
 # proje kökünü modül yoluna ekle
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -29,7 +31,7 @@ class FactoryVisionUI:
         self.path_poly = None  # Polygon ya da None
         self.last_tick = time.time()
         self.fps = 0.0
-
+        self.tracker = sv.ByteTrack()
         # Sol panel
         self.left = ttk.Frame(self.root, padding=10)
         self.left.pack(side=tk.LEFT, fill=tk.Y)
@@ -137,70 +139,91 @@ class FactoryVisionUI:
             self.stop_camera()
             return
 
-        # inference
+        # YOLO tahmin
         dets = self.detector.predict(frame, conf=0.35, imgsz=640)
-
         out = frame.copy()
 
-        # Sarı yolu çiz (varsa)
-        if self.path_poly is not None:
-            pts = np.array(self.path_poly.exterior.coords, dtype=np.int32)
-            cv2.polylines(out, [pts], True, (0, 255, 255), 2)
+        # YOLO sonuçlarını Supervision formatına çevir
+        boxes, scores, class_ids = [], [], []
+        for d in dets:
+            boxes.append([d.box[0], d.box[1], d.box[2], d.box[3]])
+            scores.append(d.score)
+            class_ids.append(d.cls_id)
 
-        # sınıf eşleme
+        detections = sv.Detections(
+            xyxy=np.array(boxes),
+            confidence=np.array(scores),
+            class_id=np.array(class_ids)
+        )
+
+        # Class id listeleri
         names = self.class_names
         person_ids = [i for i, n in names.items() if str(n).lower() in ("person", "pedestrian")]
         helmet_ids = [i for i, n in names.items() if "helmet" in str(n).lower()]
         vest_ids   = [i for i, n in names.items() if "vest"   in str(n).lower()]
 
-        # basit PPE eşleme: helmet/vest merkezleri person kutusu içinde mi
+        # Sadece person track et
+        mask = np.isin(detections.class_id, person_ids)
+        detections = detections[mask]
+
+        # Tracking
+        tracks = self.tracker.update_with_detections(detections)
+
+        # Yol çiz
+        if self.path_poly is not None:
+            pts = np.array(self.path_poly.exterior.coords, dtype=np.int32)
+            cv2.polylines(out, [pts], True, (0, 255, 255), 2)
+
+        # Yardımcı fonksiyonlar
         def center(box):
             x1, y1, x2, y2 = box
             return (int((x1 + x2) / 2), int((y1 + y2) / 2))
+
         def inside(box_a, pt):
             x1, y1, x2, y2 = box_a
             return (x1 <= pt[0] <= x2) and (y1 <= pt[1] <= y2)
+
         def foot(box):
             x1, y1, x2, y2 = box
             return (int((x1 + x2) / 2), int(y2))
 
-        persons = [d for d in dets if d.cls_id in person_ids]
+        # Mevcut frame’deki helmet ve vest’leri ayır
         helmets = [d for d in dets if d.cls_id in helmet_ids]
         vests   = [d for d in dets if d.cls_id in vest_ids]
 
-        # Yol dışı kontrol: tracking yoksa, basit “anlık” gösterim (timer, ileride tracking ekleyince tam çalışacak)
-        # Şimdilik RegionStayTimer'ı bbox merkezine ID veremediğimiz için kullanmıyoruz.
-        # Tracking eklediğinde aynı ID için self.timer.update(track_id, not in_path) çağır.
-        for p in persons:
-            x1, y1, x2, y2 = p.box
-            p_center = center(p.box)
-            p_foot   = foot(p.box)
+        # Her track için kontrol
+        for xyxy, track_id, _, _ in tracks:
+            x1, y1, x2, y2 = map(int, xyxy)
+            p_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            p_foot   = ((x1 + x2) // 2, int(y2))
 
-            # PPE kontrolü (isteğe bağlı)
-            has_h = any(inside(p.box, center(h.box)) for h in helmets) if self.chk_ppe_var.get() else True
-            has_v = any(inside(p.box, center(v.box)) for v in vests)   if self.chk_ppe_var.get() else True
+            # PPE kontrol
+            has_h = any(inside([x1, y1, x2, y2], center(h.box)) for h in helmets) if self.chk_ppe_var.get() else True
+            has_v = any(inside([x1, y1, x2, y2], center(v.box)) for v in vests)   if self.chk_ppe_var.get() else True
 
-            # Yol kontrolü
+            # Yol kontrol
             in_path = True
             if self.chk_path_var.get() and self.path_poly is not None:
-                in_path = self.path_poly.contains(Point(p_foot[0], p_foot[1]))
+                in_path = self.path_poly.contains(Point(*p_foot))
 
-            ok_person = in_path and has_h and has_v
-            color = (0, 200, 0) if ok_person else (0, 0, 255)
+            # Timer ile violation tespiti
+            violation_time = self.timer.update(int(track_id), condition=(not in_path))
+            violation = (violation_time >= VIOL_THRESH)
 
-            msg = []
-            if self.chk_path_var.get():
-                msg.append(f"in:{int(in_path)}")
-            if self.chk_ppe_var.get():
-                msg.append(f"H:{int(has_h)} V:{int(has_v)}")
+            # Renk ve mesaj
+            color = (0, 0, 255) if violation or not has_h or not has_v else (0, 200, 0)
+            msg = [f"ID:{track_id}"]
+            if self.chk_path_var.get(): msg.append(f"in:{int(in_path)}")
+            if self.chk_ppe_var.get(): msg.append(f"H:{int(has_h)} V:{int(has_v)}")
+            if violation: msg.append(f"OUT:{violation_time:.1f}s")
 
+            # Çizimler
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            if msg:
-                cv2.putText(out, " ".join(msg), (x1, max(20, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(out, " ".join(msg), (x1, max(20, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             cv2.circle(out, p_foot, 4, (255, 255, 255), -1)
 
-        # FPS
+        # FPS hesapla
         now = time.time()
         dt = now - self.last_tick
         if dt > 0:
@@ -208,15 +231,15 @@ class FactoryVisionUI:
         self.last_tick = now
         self.fps_lbl.config(text=f"FPS: {self.fps:.1f}")
 
-        # TK görüntüle
+        # Tkinter’de görüntüle
         rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-        # sonraki kare
         self.root.after(30, self.update_frame)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
