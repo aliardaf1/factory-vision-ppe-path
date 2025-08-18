@@ -186,3 +186,5 @@ data/
 *.pt
 *.onnx
 runs/
+train_code/
+datasets/

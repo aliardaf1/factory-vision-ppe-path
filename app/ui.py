@@ -1,143 +1,178 @@
 # app/ui.py
-import sys, os
+import sys, os, time
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import cv2
-import time
-import json
 import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
-import torch
-from shapely.geometry import Point, Polygon
-import supervision as sv
+from tkinter import ttk, filedialog, messagebox
 
-from detectors.yolo_v8 import YOLOv8Detector
-from core.region_timer import RegionStayTimer
+from app.pipeline import ModelManager, YoloDetAdapter, YoloSegAdapter
 
-# ==== AYARLAR ====
-VIOL_THRESH = 1.0           # yol DIŞI kalma eşiği (saniye)
-CAM_INDEX   = 0             # kamera indexi
-VIEW_W, VIEW_H = 1280, 720  # ekranda gösterilecek sabit boyut
+# ================== AYARLAR ==================
+VIEW_W, VIEW_H = 1280, 720  # görüntüyü buna göre ölçekleriz
+# Modeller: asıl (varsa) + fallback (kesin yerel)
+PPE_DET_WEIGHTS   = r"models/ppe_det.pt"
+PATH_SEG_WEIGHTS  = r"models/line_detection.pt"
+FALLBACK_DET      = r"yolov8n.pt"
+FALLBACK_SEG      = r"yolov8n-seg.pt"
+# =============================================
 
-MODEL_PATH_DEFAULT = "yolov8n.pt"           # COCO ile başla; PPE modeli gelince değiştir
-POLY_JSON_DEFAULT  = "app/path_polygon.json"
-
-# =================
 
 class FactoryVisionApp:
     def __init__(self):
+        # ---- PENCERE / TEMA ----
         self.root = tk.Tk()
-        self.root.title("Factory Vision — PPE & Path Monitor")
+        self.root.title("Factory Vision — Kaynak Seçimli UI")
         self.root.configure(bg="black")
         self.root.attributes("-fullscreen", True)
         self.root.bind("<Escape>", lambda e: self._on_exit())
 
-        # --- ÜST SABİT PANEL ---
-        top = tk.Frame(self.root, bg="black")
-        top.pack(side="top", fill="x", pady=8)
-
-        btn_style = dict(bg="gray20", fg="white", font=("Arial", 14), relief="flat", padx=16, pady=6)
-        tk.Button(top, text="Başlat", command=self.start, **btn_style).pack(side="left", padx=10)
-        tk.Button(top, text="Durdur", command=self.stop,  **btn_style).pack(side="left", padx=10)
-
-        # seçenekler
-        self.chk_ppe = tk.BooleanVar(value=True)
-        self.chk_path = tk.BooleanVar(value=True)
-        opt_style = dict(bg="black", fg="white", selectcolor="black", activebackground="black",
-                         activeforeground="white", font=("Arial", 12))
-        tk.Checkbutton(top, text="PPE (Baret/Yelek)", variable=self.chk_ppe, **opt_style).pack(side="left", padx=20)
-        tk.Checkbutton(top, text="Sarı Yol Dışı", variable=self.chk_path, **opt_style).pack(side="left")
-
-        # durum yazıları
-        self.fps_lbl = tk.Label(top, text="FPS: -", bg="black", fg="white", font=("Arial", 14))
-        self.fps_lbl.pack(side="right", padx=20)
-        self.status_lbl = tk.Label(top, text="Durum: Hazır", bg="black", fg="white", font=("Arial", 12))
-        self.status_lbl.pack(side="right", padx=20)
-
-        # --- ORTA KAMERA ALANI (SABİT) ---
-        mid = tk.Frame(self.root, bg="black")
-        mid.pack(expand=True)
-        self.video_label = tk.Label(mid, bg="black")
-        self.video_label.pack()
-
-        # --- ALT SABİT PANEL (dosya yolları) ---
-        bottom = tk.Frame(self.root, bg="black")
-        bottom.pack(side="bottom", fill="x", pady=8)
-
-        lbl_style = dict(bg="black", fg="white", font=("Arial", 11))
-        ent_style = dict(bg="gray10", fg="white", insertbackground="white", relief="flat")
-
-        tk.Label(bottom, text="Model:", **lbl_style).pack(side="left", padx=(12,5))
-        self.model_path_var = tk.StringVar(value=MODEL_PATH_DEFAULT)
-        tk.Entry(bottom, textvariable=self.model_path_var, width=36, **ent_style).pack(side="left")
-
-        tk.Label(bottom, text="Yol Poligonu:", **lbl_style).pack(side="left", padx=(20,5))
-        self.poly_path_var = tk.StringVar(value=POLY_JSON_DEFAULT)
-        tk.Entry(bottom, textvariable=self.poly_path_var, width=36, **ent_style).pack(side="left")
-
-        # --- ARKA PLAN DURUMLARI ---
+        # ---- DURUMLAR ----
+        self.source_type = tk.StringVar(value="Webcam")  # Webcam | Resim | Video
+        self.source_path = None
         self.cap = None
         self.running = False
+        self.frame_idx = 0
         self.last_tick = time.time()
         self.fps = 0.0
 
-        # model / tracker / timer / poligon
-        self.detector = None
-        self.class_names = {}
-        self.tracker = sv.ByteTrack()
-        self.timer = RegionStayTimer()
-        self.path_poly = None
+        # ---- SOL KONTROL PANELİ ----
+        left = tk.Frame(self.root, bg="black")
+        left.pack(side="left", fill="y", padx=16, pady=16)
 
-        # model ve poligonu ön-yükle (hata verirse yine de UI açılır)
-        self._ensure_model()
-        self._load_polygon()
+        lbl_style = dict(bg="black", fg="white", font=("Arial", 12))
+        btn_style = dict(bg="gray20", fg="white", relief="flat", font=("Arial", 12), padx=10, pady=6)
 
-    # ===== Yardımcılar =====
-    def _ensure_model(self):
-        if self.detector is not None:
-            return
-        try:
-            self.detector = YOLOv8Detector()
-            self.detector.load(self.model_path_var.get().strip() or MODEL_PATH_DEFAULT, device="cuda")
-            self.class_names = self.detector.class_names()
-            self._set_status(f"Model yüklendi: {os.path.basename(self.model_path_var.get()) or MODEL_PATH_DEFAULT}")
-        except Exception as e:
-            self._set_status(f"Model yüklenemedi: {e}")
+        tk.Label(left, text="Kaynak:", **lbl_style).pack(anchor="w")
+        self.combo_source = ttk.Combobox(
+            left, values=["Webcam", "Resim", "Video"],
+            textvariable=self.source_type, state="readonly", width=18
+        )
+        self.combo_source.pack(anchor="w", pady=6)
+        self.combo_source.bind("<<ComboboxSelected>>", self.on_source_change)
 
-    def _load_polygon(self):
-        path = self.poly_path_var.get().strip() or POLY_JSON_DEFAULT
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                coords = json.load(f)
-            if not (isinstance(coords, list) and len(coords) >= 3):
-                raise ValueError("Geçersiz poligon")
-            self.path_poly = Polygon(coords)
-            self._set_status(f"Poligon yüklendi ({len(coords)} nokta)")
-        except Exception as e:
-            self.path_poly = None
-            self._set_status(f"Poligon yok: {e}")
+        self.btn_select = tk.Button(left, text="Dosya Seç", command=self.select_file, **btn_style)
+        self.btn_select.pack(anchor="w", pady=6, fill="x")
+        self.btn_select.config(state="disabled")
 
-    def _set_status(self, msg: str):
-        self.status_lbl.config(text=f"Durum: {msg}")
+        # Başlat / Durdur
+        self.btn_start = tk.Button(left, text="Başlat", command=self.start, **btn_style)
+        self.btn_start.pack(anchor="w", pady=(16, 6), fill="x")
+        self.btn_stop = tk.Button(left, text="Durdur", command=self.stop, **btn_style)
+        self.btn_stop.pack(anchor="w", pady=6, fill="x")
+
+                # ------------------ MODEL CHECKBOXLARI ------------------
+        tk.Label(left, text="Aktif Modeller:", **lbl_style).pack(anchor="w", pady=(16, 4))
+        self.var_ppe = tk.BooleanVar(value=True)
+        self.var_path = tk.BooleanVar(value=True)
+        tk.Checkbutton(left, text="PPE Detection", variable=self.var_ppe,
+                       bg="black", fg="white", selectcolor="black",
+                       activebackground="black", command=self.update_model_flags).pack(anchor="w")
+        tk.Checkbutton(left, text="Path Segmentation", variable=self.var_path,
+                       bg="black", fg="white", selectcolor="black",
+                       activebackground="black", command=self.update_model_flags).pack(anchor="w")
+        
+        # FPS ve durum
+        self.fps_lbl = tk.Label(left, text="FPS: -", **lbl_style)
+        self.fps_lbl.pack(anchor="w", pady=(16, 4))
+        self.status_lbl = tk.Label(left, text="Durum: Hazır", **lbl_style)
+        self.status_lbl.pack(anchor="w")
+
+        # ---- SAĞ GÖRÜNTÜ PANELİ ----
+        right = tk.Frame(self.root, bg="black")
+        right.pack(side="right", expand=True, fill="both")
+        self.video_label = tk.Label(right, bg="black")
+        self.video_label.pack(expand=True)
+
+        # ---- MODEL MANAGER ----
+        self.mm = ModelManager()
+        self.mm.register(
+            "path",
+            YoloSegAdapter(PATH_SEG_WEIGHTS, name_prefix="path",
+                           conf=0.1, imgsz=640, interval=1,
+                           fallback_path=FALLBACK_SEG, allow_download=False),
+            enabled=True
+        )
+        self.mm.register(
+            "ppe",
+            YoloDetAdapter(PPE_DET_WEIGHTS, name_prefix="ppe",
+                           conf=0.40, imgsz=640, interval=1,
+                           fallback_path=FALLBACK_DET, allow_download=False),
+            enabled=True
+        )
+
+    # ------------------------- Yardımcılar -------------------------
+    def _set_status(self, text: str):
+        self.status_lbl.config(text=f"Durum: {text}")
 
     def _on_exit(self):
         self.stop()
         self.root.destroy()
+    
+    # ------------------ Model checkbox güncelle ------------------
+    def update_model_flags(self):
+        self.mm.set_enabled("ppe", self.var_ppe.get())
+        self.mm.set_enabled("path", self.var_path.get())
 
-    # ===== Kamera Kontrolleri =====
+
+    # ------------------------- Kaynak seçim & dosya diyalogu -------------------------
+    def on_source_change(self, event=None):
+        sel = self.source_type.get()
+        if sel in ("Resim", "Video"):
+            self.btn_select.config(state="normal")
+        else:
+            self.btn_select.config(state="disabled")
+            self.source_path = None
+
+    def select_file(self):
+        sel = self.source_type.get()
+        if sel == "Resim":
+            path = filedialog.askopenfilename(
+                title="Görüntü Seç", filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"), ("All Files", "*.*")]
+            )
+        elif sel == "Video":
+            path = filedialog.askopenfilename(
+                title="Video Seç", filetypes=[("Videos", "*.mp4 *.avi *.mkv *.mov *.wmv"), ("All Files", "*.*")]
+            )
+        else:
+            return
+        if path:
+            self.source_path = path
+            self._set_status(f"Seçildi: {os.path.basename(path)}")
+
+    # ------------------------- Başlat / Durdur -------------------------
     def start(self):
         if self.running:
             return
-        self._ensure_model()
-        self._load_polygon()
-        self.cap = cv2.VideoCapture(CAM_INDEX)
-        if not self.cap.isOpened():
-            self._set_status("Kamera açılamadı")
+        sel = self.source_type.get()
+
+        if sel == "Webcam":
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                messagebox.showerror("Hata", "Kamera açılamadı.")
+                return
+        elif sel == "Video":
+            if not self.source_path:
+                messagebox.showwarning("Uyarı", "Önce bir video dosyası seçin.")
+                return
+            self.cap = cv2.VideoCapture(self.source_path)
+            if not self.cap.isOpened():
+                messagebox.showerror("Hata", "Video açılamadı.")
+                return
+        elif sel == "Resim":
+            if not self.source_path:
+                messagebox.showwarning("Uyarı", "Önce bir resim seçin.")
+                return
+            self.cap = None  # tek kare için capture gerekmez
+        else:
             return
+
         self.running = True
-        self._set_status("Çalışıyor")
+        self.frame_idx = 0
         self.last_tick = time.time()
+        self._set_status("Çalışıyor")
         self.update_frame()
 
     def stop(self):
@@ -147,97 +182,67 @@ class FactoryVisionApp:
             self.cap = None
         self._set_status("Durduruldu")
 
-    # ===== Ana Döngü =====
+    # ------------------------- Görüntü işleme döngüsü -------------------------
     def update_frame(self):
         if not self.running:
             return
 
-        ok, frame = self.cap.read()
-        if not ok:
-            self.stop()
+        # 1) Kaynaktan frame al
+        frame = None
+        sel = self.source_type.get()
+
+        if sel == "Resim":
+            frame = cv2.imread(self.source_path)
+            if frame is None:
+                self._set_status("Resim okunamadı!")
+                self.running = False
+        elif self.cap is not None:
+            ok, frm = self.cap.read()
+            if not ok:
+                self.stop()
+                return
+            frame = frm
+
+        if frame is None:
             return
 
-        # sabit gösterim boyutuna ölçekle
-        frame = cv2.resize(frame, (VIEW_W, VIEW_H), interpolation=cv2.INTER_AREA)
-
-        # 1) YOLO tespit
-        dets = self.detector.predict(frame, conf=0.35, imgsz=640)
+        # 2) Ölçekle (gösterim için)
+        frame = self._resize_keep_aspect(frame, (VIEW_W, VIEW_H))
         out = frame.copy()
 
-        # 2) Yol poligonunu çiz
-        if self.path_poly is not None:
-            pts = np.array(self.path_poly.exterior.coords, dtype=np.int32)
-            cv2.polylines(out, [pts], True, (0, 255, 255), 2)
+        # 3) Inference (çoklu model)
+        res = self.mm.infer(frame, frame_idx=self.frame_idx)
+        self.frame_idx += 1
+        
+        # Debug: Mask bilgilerini yazdır
+        print(f"Frame {self.frame_idx}: Found {len(res['masks'])} masks")
+        for m in res['masks']:
+            print(f"Mask class: {m.cls_name}, source: {m.source}")
 
-        # 3) Sınıf id listeleri
-        names = self.class_names
-        person_ids = [i for i, n in names.items() if str(n).lower() in ("person", "pedestrian")]
-        helmet_ids = [i for i, n in names.items() if "helmet" in str(n).lower()]
-        vest_ids   = [i for i, n in names.items() if "vest"   in str(n).lower()]
+        # 4) Mask overlay (walk_zone)
+        # path:* sınıflarını tek maske gibi uygula (ilk bulunanı alıyoruz)
+        path_mask = None
+        for m in res["masks"]:
+            if m.cls_name.lower().startswith("path:"):
+                # Maskeyi görüntü boyutuna uygun şekilde yeniden boyutlandır
+                mask = m.mask.astype(bool)
+                h, w = out.shape[:2]
+                path_mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+                break
+        
+        if path_mask is not None:
+            color = np.array((0, 180, 80), dtype=np.float32)  # yeşilimsi
+            out[path_mask] = (0.45 * color + 0.55 * out[path_mask]).astype(np.uint8)
 
-        # Yardımcılar
-        def center(box):
-            x1, y1, x2, y2 = box
-            return (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        # 5) BBox çiz
+        for d in res["detections"]:
+            x1, y1, x2, y2 = map(int, d.xyxy)
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 200, 255), 2)
+            label = f"{d.cls_name} {d.conf:.2f}"
+            cv2.putText(out, label, (x1, max(20, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
-        def inside(box_a, pt):
-            x1, y1, x2, y2 = box_a
-            return (x1 <= pt[0] <= x2) and (y1 <= pt[1] <= y2)
-
-        def foot(box):
-            x1, y1, x2, y2 = box
-            return (int((x1 + x2) / 2), int(y2))
-
-        # 4) Tespitleri ayır
-        persons = [d for d in dets if d.cls_id in person_ids]
-        helmets = [d for d in dets if d.cls_id in helmet_ids]
-        vests   = [d for d in dets if d.cls_id in vest_ids]
-
-        # 5) Tracking (yalnız person)
-        if persons:
-            xyxy  = np.array([p.box for p in persons], dtype=np.float32)
-            confs = np.array([p.score for p in persons], dtype=np.float32)
-            cids  = np.array([p.cls_id for p in persons], dtype=np.int32)
-            det_sv = sv.Detections(xyxy=xyxy, confidence=confs, class_id=cids)
-            tracks = self.tracker.update_with_detections(det_sv)
-        else:
-            tracks = sv.Detections.empty()
-
-        # 6) Her track için kurallar
-        for i in range(len(tracks)):
-            x1, y1, x2, y2 = map(int, tracks.xyxy[i])
-            track_id = int(tracks.tracker_id[i]) if tracks.tracker_id is not None else i
-            p_box  = (x1, y1, x2, y2)
-            p_foot = foot(p_box)
-
-            # PPE
-            has_h = any(inside(p_box, center(h.box)) for h in helmets) if self.chk_ppe.get() else True
-            has_v = any(inside(p_box, center(v.box)) for v in vests)   if self.chk_ppe.get() else True
-
-            # Yol
-            in_path = True
-            if self.chk_path.get() and self.path_poly is not None:
-                in_path = self.path_poly.contains(Point(*p_foot))
-
-            # Süre bazlı ihlal
-            violation_time = self.timer.update(track_id, condition=(not in_path))
-            violation = (violation_time >= VIOL_THRESH)
-
-            ok_person = (in_path and has_h and has_v and not violation)
-            color = (0, 200, 0) if ok_person else (0, 0, 255)
-
-            parts = [f"ID:{track_id}"]
-            if self.chk_path.get():
-                parts += [f"Iceride:{int(in_path)}", f"Saniye:{violation_time:.1f}s", f"Ihlal:{int(violation)}"]
-            if self.chk_ppe.get():
-                parts += [f"Baret:{int(has_h)}", f"Yelek:{int(has_v)}"]
-            label = " ".join(parts)
-
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(out, label, (x1, max(20, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            cv2.circle(out, p_foot, 4, (255, 255, 255), -1)
-
-        # 7) FPS
+        # 6) FPS
         now = time.time()
         dt = now - self.last_tick
         if dt > 0:
@@ -245,25 +250,44 @@ class FactoryVisionApp:
         self.last_tick = now
         self.fps_lbl.config(text=f"FPS: {self.fps:.1f}")
 
-        # 8) TK görüntüle (siyah arkaplanda)
+        # 7) TK gösterim
         rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-        # 9) Döngü
-        self.root.after(30, self.update_frame)
+        # Resim tek kare olduğu için otomatik durdur
+        if sel == "Resim":
+            self.running = False
+            self._set_status("Tek kare gösterildi.")
+            return
 
-    # ===== Çalıştır =====
+        # Video/Webcam için döngü
+        if self.running:
+            self.root.after(1, self.update_frame)
+
+    # ------------------------- Yardımcı: oranı koruyarak boyutlandır -------------------------
+    @staticmethod
+    def _resize_keep_aspect(img, target_hw):
+        tw, th = target_hw
+        h, w = img.shape[:2]
+        scale = min(tw / w, th / h)
+        nw, nh = int(w * scale), int(h * scale)
+        if nw <= 0 or nh <= 0:
+            return cv2.resize(img, (tw, th))
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+        # siyah zemin üzerine ortala
+        canvas = np.zeros((th, tw, 3), dtype=np.uint8)
+        y0 = (th - nh) // 2
+        x0 = (tw - nw) // 2
+        canvas[y0:y0+nh, x0:x0+nw] = resized
+        return canvas
+
+    # ------------------------- Çalıştır -------------------------
     def run(self):
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    app = FactoryVisionApp()
-    if torch.cuda.is_available():
-        print("GPU aktif:", torch.cuda.get_device_name(0))
-    else:
-        print("GPU kullanılmıyor, CPU'da çalışıyor")
-    app.run()
+    FactoryVisionApp().run()
