@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 import numpy as np
 import os
+import re
 
 # ---- Birleşik çıkış tipleri ----
 class Detection:
@@ -60,12 +61,57 @@ def safe_load_yolo(weights_path: str | None,
         "İndirme kapalı (allow_download=False)."
     )
 
+# isim normalize edici
+def _norm(name: str) -> str:
+    k = str(name).strip().lower()
+    k = re.sub(r"[\s\-]+", "_", k)        # "NO-Safety Vest" -> "no_safety_vest"
+    k = re.sub(r"[^a-z0-9_]+", "", k)
+    return k
+
+# alias haritası: ham etiket -> kanonik
+ALIAS_MAP = {
+    # helmet (+)
+    "helmet": "helmet",
+    "hardhat": "helmet",
+    "head_helmet": "helmet",
+
+    # helmet (-)
+    "not_helmet": "not_helmet",
+    "no_hardhat": "not_helmet",
+    "nohelmet": "not_helmet",
+    "head_nohelmet": "not_helmet",
+
+    # vest (+)
+    "vest": "vest",
+    "vests": "vest",
+    "safety_vest": "vest",
+    "safetyvest": "vest",
+    "reflective_vest": "vest",
+    "reflectivevest": "vest",
+    "reflective": "vest",           # ← özellikle istedin
+
+    # vest (-)
+    "not_vest": "not_vest",
+    "no_safety_vest": "not_vest",
+    "no_safetyvest": "not_vest",
+    "not_reflective": "not_vest",
+
+    # ilgisizleri at (None verirsen filtre aşağıda zaten skip eder)
+    "no_mask": None,
+    "nomask": None,
+}
+
+CANONICAL = {"helmet", "vest", "not_helmet", "not_vest"}
+DEFAULT_PCC = {"helmet": 0.60, "vest": 0.60, "not_helmet": 0.45, "not_vest": 0.45}
+
 class YoloDetAdapter(BaseAdapter):
-    """YOLOv8 detection (bbox) modeli için adapter (ör: PPE/person/forklift)"""
     def __init__(self, weights: str, device: Optional[str] = None,
                  name_prefix: str = "ppe", conf: float = 0.35, imgsz: int = 640,
                  interval: int = 1, half: bool = True,
-                 fallback_path: Optional[str] = None, allow_download: bool = False):
+                 fallback_path: Optional[str] = None, allow_download: bool = False,
+                 alias_map: Optional[dict] = None,
+                 include_canonical: Optional[set] = None,
+                 per_class_conf: Optional[dict] = None):
         super().__init__(name_prefix, interval)
         self.model = safe_load_yolo(weights, fallback_path=fallback_path, allow_download=allow_download)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -74,37 +120,47 @@ class YoloDetAdapter(BaseAdapter):
         self.imgsz = imgsz
         self.half = half and self.device.startswith("cuda")
         try:
-            if self.half:
-                self.model.model.half()
+            if self.half: self.model.model.half()
         except Exception:
             self.half = False
         self.names = getattr(self.model.model, "names", getattr(self.model, "names", {}))
 
+        self.alias_map = dict(alias_map or ALIAS_MAP)
+        self.include_canonical = set(include_canonical or CANONICAL)
+        self.per_class_conf = {**DEFAULT_PCC, **(per_class_conf or {})}
+
     def predict(self, frame_bgr):
         out = {"detections": [], "masks": []}
         res = self.model.predict(
-            frame_bgr,
-            imgsz=self.imgsz,
-            conf=self.conf,
+            frame_bgr, imgsz=self.imgsz, conf=self.conf,
             device=0 if self.device.startswith("cuda") else "cpu",
-            verbose=False,
-            half=self.half
+            verbose=False, half=self.half
         )
         r = res[0]
         if r.boxes is None or len(r.boxes) == 0:
             return out
-        xyxy = r.boxes.xyxy
-        conf = r.boxes.conf
-        cls  = r.boxes.cls
-        # CPU'ya indir
-        xyxy = xyxy.detach().cpu().numpy()
-        conf = conf.detach().cpu().numpy()
-        cls  = cls.detach().cpu().numpy().astype(int)
+
+        xyxy = r.boxes.xyxy.detach().cpu().numpy()
+        conf = r.boxes.conf.detach().cpu().numpy()
+        cls  = r.boxes.cls.detach().cpu().numpy().astype(int)
+
         for i in range(len(cls)):
-            name = self.names.get(int(cls[i]), str(int(cls[i])))
+            raw = self.names.get(int(cls[i]), str(int(cls[i])))
+            key = _norm(raw)
+            mapped = self.alias_map.get(key, None)
+            if mapped is None or mapped not in self.include_canonical:
+                continue
+            thr = float(self.per_class_conf.get(mapped, self.conf))
+            if float(conf[i]) < thr:
+                continue
+
             out["detections"].append(
-                Detection(xyxy=xyxy[i], conf=conf[i], cls_id=int(cls[i]),
-                          cls_name=f"{self.prefix}:{name}", source=self.prefix)
+                Detection(
+                    xyxy=xyxy[i], conf=float(conf[i]),
+                    cls_id=int(cls[i]),
+                    cls_name=f"{self.prefix}:{mapped}",  # ppe:helmet/vest/not_*
+                    source=self.prefix
+                )
             )
         return out
 

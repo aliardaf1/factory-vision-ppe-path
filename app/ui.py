@@ -13,12 +13,45 @@ from app.pipeline import ModelManager, YoloDetAdapter, YoloSegAdapter
 # ================== AYARLAR ==================
 VIEW_W, VIEW_H = 1280, 720  # görüntüyü buna göre ölçekleriz
 # Modeller: asıl (varsa) + fallback (kesin yerel)
-PPE_DET_WEIGHTS   = r"models/ppe_det.pt"
+PPE_DET_WEIGHTS   = r"models/ppe_model_v1.pt"
 PATH_SEG_WEIGHTS  = r"models/line_detection.pt"
 FALLBACK_DET      = r"yolov8n.pt"
 FALLBACK_SEG      = r"yolov8n-seg.pt"
 # =============================================
+ALIAS_MAP = {
+    # helmet (+)
+    "helmet": "helmet",
+    "hardhat": "helmet",
+    "head_helmet": "helmet",
 
+    # helmet (-)
+    "not_helmet": "not_helmet",
+    "no_hardhat": "not_helmet",
+    "nohelmet": "not_helmet",
+    "head_nohelmet": "not_helmet",
+
+    # vest (+)
+    "vest": "vest",
+    "vests": "vest",
+    "safety_vest": "vest",
+    "safetyvest": "vest",
+    "reflective_vest": "vest",
+    "reflectivevest": "vest",
+    "reflective": "vest",           # ← özellikle istedin
+
+    # vest (-)
+    "not_vest": "not_vest",
+    "no_safety_vest": "not_vest",
+    "no_safetyvest": "not_vest",
+    "not_reflective": "not_vest",
+
+    # ilgisizleri at (None verirsen filtre aşağıda zaten skip eder)
+    "no_mask": None,
+    "nomask": None,
+}
+
+CANONICAL = {"helmet", "vest", "not_helmet", "not_vest"}
+DEFAULT_PCC = {"helmet": 0.70, "vest": 0.70, "not_helmet": 0.50, "not_vest": 0.50}
 
 class FactoryVisionApp:
     def __init__(self):
@@ -98,9 +131,12 @@ class FactoryVisionApp:
         self.mm.register(
             "ppe",
             YoloDetAdapter(PPE_DET_WEIGHTS, name_prefix="ppe",
-                           conf=0.40, imgsz=640, interval=1,
-                           fallback_path=FALLBACK_DET, allow_download=False),
-            enabled=True
+                           conf=0.20, imgsz=768, interval=1,
+                           fallback_path=FALLBACK_DET, allow_download=False,
+                           alias_map=ALIAS_MAP,              # alias aktif
+                           include_canonical=CANONICAL,      # sadece 4 sınıf
+                           per_class_conf=DEFAULT_PCC,        # sınıf başı eşik),
+                           )
         )
 
     # ------------------------- Yardımcılar -------------------------
@@ -110,7 +146,7 @@ class FactoryVisionApp:
     def _on_exit(self):
         self.stop()
         self.root.destroy()
-    
+        
     # ------------------ Model checkbox güncelle ------------------
     def update_model_flags(self):
         self.mm.set_enabled("ppe", self.var_ppe.get())
@@ -187,13 +223,18 @@ class FactoryVisionApp:
         if not self.running:
             return
 
-        # 1) Kaynaktan frame al
-        frame = None
+        # ---- 0) Ayarlar / cache ----
+        DETECT_EVERY = getattr(self, "DETECT_EVERY", 2)  # her 2 karede bir inference
+        if not hasattr(self, "_last_res"):
+            self._last_res = {"detections": [], "masks": []}
+
+        # ---- 1) Kaynaktan HAM kareyi al ----
+        frame_raw = None
         sel = self.source_type.get()
 
         if sel == "Resim":
-            frame = cv2.imread(self.source_path)
-            if frame is None:
+            frame_raw = cv2.imread(self.source_path)
+            if frame_raw is None:
                 self._set_status("Resim okunamadı!")
                 self.running = False
         elif self.cap is not None:
@@ -201,48 +242,64 @@ class FactoryVisionApp:
             if not ok:
                 self.stop()
                 return
-            frame = frm
+            frame_raw = frm
 
-        if frame is None:
+        if frame_raw is None:
             return
 
-        # 2) Ölçekle (gösterim için)
-        frame = self._resize_keep_aspect(frame, (VIEW_W, VIEW_H))
-        out = frame.copy()
+        H0, W0 = frame_raw.shape[:2]
 
-        # 3) Inference (çoklu model)
-        res = self.mm.infer(frame, frame_idx=self.frame_idx)
+        # ---- 2) Inference: her N karede bir, arada son çıktıyı kullan ----
+        do_infer = (self.frame_idx % max(1, DETECT_EVERY) == 0)
+        if do_infer:
+            res = self.mm.infer(frame_raw, frame_idx=self.frame_idx)
+            self._last_res = res
+        else:
+            res = self._last_res
         self.frame_idx += 1
-        
-        # Debug: Mask bilgilerini yazdır
-        print(f"Frame {self.frame_idx}: Found {len(res['masks'])} masks")
-        for m in res['masks']:
-            print(f"Mask class: {m.cls_name}, source: {m.source}")
 
-        # 4) Mask overlay (walk_zone)
-        # path:* sınıflarını tek maske gibi uygula (ilk bulunanı alıyoruz)
+        # ---- 3) Çizimi HAM boyutta yap (tek ölçekleme ile daha hızlı) ----
+        out_raw = frame_raw.copy()
+
+        # 3.a) Yürüyüş yolu maskesi: maskeyi ham boyuta eşle
         path_mask = None
         for m in res["masks"]:
             if m.cls_name.lower().startswith("path:"):
-                # Maskeyi görüntü boyutuna uygun şekilde yeniden boyutlandır
                 mask = m.mask.astype(bool)
-                h, w = out.shape[:2]
-                path_mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+                mh, mw = mask.shape[:2]
+                if (mh, mw) != (H0, W0):
+                    mask = cv2.resize(mask.astype(np.uint8), (W0, H0),
+                                    interpolation=cv2.INTER_NEAREST).astype(bool)
+                path_mask = mask
                 break
-        
         if path_mask is not None:
-            color = np.array((0, 180, 80), dtype=np.float32)  # yeşilimsi
-            out[path_mask] = (0.45 * color + 0.55 * out[path_mask]).astype(np.uint8)
+            color = np.array((0, 180, 80), dtype=np.float32)
+            out_raw[path_mask] = (0.45 * color + 0.55 * out_raw[path_mask]).astype(np.uint8)
 
-        # 5) BBox çiz
+        # 3.b) Sadece 4 kanonik sınıfı çiz
+        def _canon(n: str) -> str:
+            n = str(n).split(":", 1)[-1].lower().replace("-", " ")
+            return "_".join(n.split())
+
+        keep = []
         for d in res["detections"]:
-            x1, y1, x2, y2 = map(int, d.xyxy)
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 200, 255), 2)
-            label = f"{d.cls_name} {d.conf:.2f}"
-            cv2.putText(out, label, (x1, max(20, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            name = _canon(d.cls_name)
+            if name in {"helmet", "vest", "not_helmet", "not_vest"}:
+                keep.append(d)
 
-        # 6) FPS
+        for d in keep:
+            x1, y1, x2, y2 = map(int, d.xyxy)  # ham koordinatlar
+            name = _canon(d.cls_name)
+            color = (0, 200, 0) if name in {"helmet", "vest"} else (0, 0, 255)
+            cv2.rectangle(out_raw, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(out_raw, f"{d.cls_name} {d.conf:.2f}",
+                        (x1, max(20, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # ---- 4) SADECE GÖSTERİM İÇİN küçült (tek kez) ----
+        out = self._resize_keep_aspect(out_raw, (VIEW_W, VIEW_H))
+
+        # ---- 5) FPS ----
         now = time.time()
         dt = now - self.last_tick
         if dt > 0:
@@ -250,22 +307,23 @@ class FactoryVisionApp:
         self.last_tick = now
         self.fps_lbl.config(text=f"FPS: {self.fps:.1f}")
 
-        # 7) TK gösterim
+        # ---- 6) TK gösterim ----
         rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-        # Resim tek kare olduğu için otomatik durdur
+        # ---- 7) Resimse durdur, değilse döngü ----
         if sel == "Resim":
             self.running = False
             self._set_status("Tek kare gösterildi.")
             return
 
-        # Video/Webcam için döngü
         if self.running:
             self.root.after(1, self.update_frame)
+
+
 
     # ------------------------- Yardımcı: oranı koruyarak boyutlandır -------------------------
     @staticmethod
