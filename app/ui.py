@@ -7,8 +7,10 @@ import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-
+from logger import ppe_episode_tracker
 from app.pipeline import ModelManager, YoloDetAdapter, YoloSegAdapter
+import json
+from datetime import datetime
 
 # ================== AYARLAR ==================
 VIEW_W, VIEW_H = 1280, 720  # görüntüyü buna göre ölçekleriz
@@ -138,6 +140,10 @@ class FactoryVisionApp:
                            per_class_conf=DEFAULT_PCC,        # sınıf başı eşik),
                            )
         )
+        # ---- PPE EPISODE TRACKER ----
+        self.tracker = ppe_episode_tracker.PPEEpisodeTracker(site="warehouse-A", camera_id="cam-01",
+                                 mode="global", also_console=True,
+                                 source_kind="video", evidence_delay_s=5.0)
 
     # ------------------------- Yardımcılar -------------------------
     def _set_status(self, text: str):
@@ -218,25 +224,34 @@ class FactoryVisionApp:
             self.cap = None
         self._set_status("Durduruldu")
 
-    # ------------------------- Görüntü işleme döngüsü -------------------------
+        try:
+            self.tracker.flush()
+        except Exception:
+            pass
+
     def update_frame(self):
         if not self.running:
             return
 
         # ---- 0) Ayarlar / cache ----
-        DETECT_EVERY = getattr(self, "DETECT_EVERY", 2)  # her 2 karede bir inference
+        DETECT_EVERY = getattr(self, "DETECT_EVERY", 2)   # her N karede bir inference
         if not hasattr(self, "_last_res"):
             self._last_res = {"detections": [], "masks": []}
 
         # ---- 1) Kaynaktan HAM kareyi al ----
+        sel = self.source_type.get()  # "Resim" | "Video" | "Webcam" vb.
         frame_raw = None
-        sel = self.source_type.get()
 
         if sel == "Resim":
-            frame_raw = cv2.imread(self.source_path)
-            if frame_raw is None:
-                self._set_status("Resim okunamadı!")
-                self.running = False
+            # Fotoğrafta periyodik log için döngüyü DURDURMA!
+            if not hasattr(self, "_static_image"):
+                img = cv2.imread(self.source_path)
+                if img is None:
+                    self._set_status("Resim okunamadı!")
+                    self.running = False
+                    return
+                self._static_image = img
+            frame_raw = self._static_image.copy()
         elif self.cap is not None:
             ok, frm = self.cap.read()
             if not ok:
@@ -250,18 +265,66 @@ class FactoryVisionApp:
         H0, W0 = frame_raw.shape[:2]
 
         # ---- 2) Inference: her N karede bir, arada son çıktıyı kullan ----
-        do_infer = (self.frame_idx % max(1, DETECT_EVERY) == 0)
+        cur_idx = self.frame_idx
+        do_infer = (cur_idx % max(1, DETECT_EVERY) == 0)
         if do_infer:
-            res = self.mm.infer(frame_raw, frame_idx=self.frame_idx)
+            res = self.mm.infer(frame_raw, frame_idx=cur_idx)
             self._last_res = res
         else:
             res = self._last_res
         self.frame_idx += 1
 
-        # ---- 3) Çizimi HAM boyutta yap (tek ölçekleme ile daha hızlı) ----
+        # ---- 3) LOGGING: 4 kanonik sınıfa göre missing/conf çıkar ve tracker'a gönder ----
+        def _canon(n: str) -> str:
+            n = str(n).split(":", 1)[-1].lower().replace("-", " ")
+            n = "_".join(n.split())  # "NO Safety Vest" -> "no_safety_vest"
+            # alias → kanonik
+            if n in {"helmet", "hardhat", "head_helmet"}:
+                return "helmet"
+            if n in {"vest", "vests", "safety_vest", "reflective_vest", "reflective"}:
+                return "vest"
+            if n in {"not_helmet", "no_hardhat", "nohelmet", "head_nohelmet"}:
+                return "not_helmet"
+            if n in {"not_vest", "no_safety_vest", "no_safetyvest"}:
+                return "not_vest"
+            if n == "not_reflective" or "mask" in n:
+                return ""  # ignore
+            return n
+
+        # frame içi max skorları topla
+        max_conf_frame = {"helmet": 0.0, "vest": 0.0, "not_helmet": 0.0, "not_vest": 0.0}
+        for d in res["detections"]:
+            name = _canon(d.cls_name)
+            if name in max_conf_frame:
+                c = float(d.conf)
+                if c > max_conf_frame[name]:
+                    max_conf_frame[name] = c
+
+        # eksikler: pozitif yoksa veya not_* varsa
+        missing = []
+        if (max_conf_frame["helmet"] <= 0.0) or (max_conf_frame["not_helmet"] > 0.0):
+            missing.append("helmet")
+        if (max_conf_frame["vest"]   <= 0.0) or (max_conf_frame["not_vest"]   > 0.0):
+            missing.append("vest")
+
+        try:
+            self.tracker.process_frame(
+                frame_id=int(cur_idx),
+                frame_ts=time.time(),
+                observations=[{
+                    "person_id": None,
+                    "missing": missing,
+                    "conf": {k: v for k, v in max_conf_frame.items() if v > 0.0}
+                }]
+            )
+        except Exception:
+            # logger'da bir sorun olsa bile UI aksın
+            pass
+
+        # ---- 4) ÇİZİM: ham boyutta çiz, sonda tek kez küçült ----
         out_raw = frame_raw.copy()
 
-        # 3.a) Yürüyüş yolu maskesi: maskeyi ham boyuta eşle
+        # 4.a) Yürüyüş yolu maskesi (varsa) ham boyuta eşle
         path_mask = None
         for m in res["masks"]:
             if m.cls_name.lower().startswith("path:"):
@@ -276,30 +339,22 @@ class FactoryVisionApp:
             color = np.array((0, 180, 80), dtype=np.float32)
             out_raw[path_mask] = (0.45 * color + 0.55 * out_raw[path_mask]).astype(np.uint8)
 
-        # 3.b) Sadece 4 kanonik sınıfı çiz
-        def _canon(n: str) -> str:
-            n = str(n).split(":", 1)[-1].lower().replace("-", " ")
-            return "_".join(n.split())
-
-        keep = []
+        # 4.b) Sadece {helmet, vest, not_helmet, not_vest} kutularını çiz
         for d in res["detections"]:
             name = _canon(d.cls_name)
-            if name in {"helmet", "vest", "not_helmet", "not_vest"}:
-                keep.append(d)
-
-        for d in keep:
-            x1, y1, x2, y2 = map(int, d.xyxy)  # ham koordinatlar
-            name = _canon(d.cls_name)
+            if name not in {"helmet", "vest", "not_helmet", "not_vest"}:
+                continue
+            x1, y1, x2, y2 = map(int, d.xyxy)
             color = (0, 200, 0) if name in {"helmet", "vest"} else (0, 0, 255)
             cv2.rectangle(out_raw, (x1, y1), (x2, y2), color, 2)
             cv2.putText(out_raw, f"{d.cls_name} {d.conf:.2f}",
                         (x1, max(20, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # ---- 4) SADECE GÖSTERİM İÇİN küçült (tek kez) ----
+        # ---- 5) Gösterim için küçült ----
         out = self._resize_keep_aspect(out_raw, (VIEW_W, VIEW_H))
 
-        # ---- 5) FPS ----
+        # ---- 6) FPS ----
         now = time.time()
         dt = now - self.last_tick
         if dt > 0:
@@ -307,21 +362,18 @@ class FactoryVisionApp:
         self.last_tick = now
         self.fps_lbl.config(text=f"FPS: {self.fps:.1f}")
 
-        # ---- 6) TK gösterim ----
+        # ---- 7) TK gösterim ----
         rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         imgtk = ImageTk.PhotoImage(image=img)
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-        # ---- 7) Resimse durdur, değilse döngü ----
-        if sel == "Resim":
-            self.running = False
-            self._set_status("Tek kare gösterildi.")
-            return
-
+        # ---- 8) Döngü ----
+        # Fotoğrafta da döngüye devam (5 sn aralıklı loglar için); kullanıcı stop ile durdurur.
         if self.running:
             self.root.after(1, self.update_frame)
+
 
 
 

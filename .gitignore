@@ -188,3 +188,4 @@ data/
 runs/
 train_code/
 datasets/
+logs/
