@@ -11,6 +11,7 @@ from logger import ppe_episode_tracker
 from app.pipeline import ModelManager, YoloDetAdapter, YoloSegAdapter
 import json
 from datetime import datetime
+from logger import fire_episode_logger
 
 # ================== AYARLAR ==================
 VIEW_W, VIEW_H = 1280, 720  # görüntüyü buna göre ölçekleriz
@@ -133,8 +134,6 @@ class FactoryVisionApp:
         self.video_label = tk.Label(right, bg="black")
         self.video_label.pack(expand=True)
 
-        # ---- PPE LOGGING BAYRAĞI ----
-        self.ENABLE_PPE_LOGGING = self.var_ppe.get()  # checkbox ile senkron başlasın
 
         # ---- MODEL MANAGER ----
         self.mm = ModelManager()
@@ -176,6 +175,19 @@ class FactoryVisionApp:
             evidence_delay_s=5.0
         )
 
+        # Fire logger
+        self.fire_logger = fire_episode_logger.FireEpisodeTracker(
+            site="warehouse-B", camera_id="cam-02",
+            source_kind="video",          # on_source_change ile senkronlanacak
+            evidence_delay_s=5.0,         # PPE ile aynı periyot (istersen 2.0 yap)
+            also_console=True
+        )
+
+        # Fire için logging bayrağı (checkbox ile senkron)
+        self.ENABLE_FIRE_LOGGING = self.var_fire.get()
+         # ---- PPE LOGGING BAYRAĞI ----
+        self.ENABLE_PPE_LOGGING = self.var_ppe.get()  # checkbox ile senkron başlasın
+
     # ------------------------- Yardımcılar -------------------------
     def _set_status(self, text: str):
         self.status_lbl.config(text=f"Durum: {text}")
@@ -186,31 +198,36 @@ class FactoryVisionApp:
         
     # ------------------ Model checkbox güncelle ------------------
     def update_model_flags(self):
-        # Modelleri aç/kapat
         self.mm.set_enabled("ppe",  self.var_ppe.get())
         self.mm.set_enabled("path", self.var_path.get())
         self.mm.set_enabled("fire", self.var_fire.get())
 
         # PPE loglama bayrağı
-        new_flag = bool(self.var_ppe.get())
-        was_flag = bool(getattr(self, "ENABLE_PPE_LOGGING", True))
-        self.ENABLE_PPE_LOGGING = new_flag
-
-        # PPE kapandıysa: açık epizot varsa nazikçe final’i yaz ve kapat + cache'teki PPE kutularını temizle
-        if was_flag and not new_flag:
-            try:
-                self.tracker.flush()
-            except Exception:
-                pass
+        new_ppe  = bool(self.var_ppe.get())
+        was_ppe  = bool(getattr(self, "ENABLE_PPE_LOGGING", True))
+        self.ENABLE_PPE_LOGGING = new_ppe
+        if was_ppe and not new_ppe:
+            try: self.tracker.flush()
+            except: pass
             if hasattr(self, "_last_res"):
-                self._last_res["detections"] = [
-                    d for d in self._last_res.get("detections", [])
-                    if not (str(d.cls_name).startswith("ppe:") or getattr(d, "source", "").lower() == "ppe")
-                ]
-                self._last_res["masks"] = [
-                    m for m in self._last_res.get("masks", [])
-                    if not (str(m.cls_name).lower().startswith("ppe:") or getattr(m, "source", "").lower() == "ppe")
-                ]
+                self._last_res["detections"] = [d for d in self._last_res.get("detections", [])
+                    if not (str(d.cls_name).startswith("ppe:") or getattr(d, "source", "").lower() == "ppe")]
+                self._last_res["masks"] = [m for m in self._last_res.get("masks", [])
+                    if not (str(m.cls_name).lower().startswith("ppe:") or getattr(m, "source", "").lower() == "ppe")]
+
+        # FIRE loglama bayrağı
+        new_fire = bool(self.var_fire.get())
+        was_fire = bool(getattr(self, "ENABLE_FIRE_LOGGING", True))
+        self.ENABLE_FIRE_LOGGING = new_fire
+        if was_fire and not new_fire:
+            try: self.fire_logger.flush()
+            except: pass
+            if hasattr(self, "_last_res"):
+                self._last_res["detections"] = [d for d in self._last_res.get("detections", [])
+                    if not (str(d.cls_name).startswith("fire:") or getattr(d, "source", "").lower() == "fire")]
+                self._last_res["masks"] = [m for m in self._last_res.get("masks", [])
+                    if not (str(m.cls_name).lower().startswith("fire:") or getattr(m, "source", "").lower() == "fire")]
+
 
     # ------------------------- Kaynak seçim & dosya diyalogu -------------------------
     def on_source_change(self, event=None):
@@ -221,9 +238,10 @@ class FactoryVisionApp:
             self.btn_select.config(state="disabled")
             self.source_path = None
 
-        # Tracker davranışını kaynağa göre ayarla
         try:
-            self.tracker.source_kind = "photo" if sel == "Resim" else "video"
+            mode = "photo" if sel == "Resim" else "video"
+            self.tracker.source_kind = mode
+            self.fire_logger.source_kind = mode
         except Exception:
             pass
 
@@ -270,9 +288,10 @@ class FactoryVisionApp:
         else:
             return
 
-        # Tracker modunu kaynağa göre güncelle
         try:
-            self.tracker.source_kind = "photo" if sel == "Resim" else "video"
+            mode = "photo" if sel == "Resim" else "video"
+            self.tracker.source_kind = mode
+            self.fire_logger.source_kind = mode
         except Exception:
             pass
 
@@ -294,10 +313,10 @@ class FactoryVisionApp:
 
         self._set_status("Durduruldu")
 
-        try:
-            self.tracker.flush()
-        except Exception:
-            pass
+        try: self.tracker.flush()
+        except: pass
+        try: self.fire_logger.flush()
+        except: pass
 
     # ------------------------- Görüntü işleme döngüsü -------------------------
     def update_frame(self):
@@ -414,6 +433,49 @@ class FactoryVisionApp:
                         "person_id": None,
                         "missing": missing,
                         "conf": {k: v for k, v in max_conf_ppe.items() if v > 0.0}
+                    }]
+                )
+            except Exception:
+                pass
+        
+        # ── 4.b) FIRE LOG
+        fire_classes = {"fire", "smoke"}
+        fire_dets = []
+        for d in res["detections"]:
+            parts = str(d.cls_name).split(":", 1)
+            if len(parts) == 2:
+                src, nm = parts[0].lower(), parts[1].lower().replace("-", " ").replace(" ", "_")
+            else:
+                src, nm = "", parts[0].lower().replace("-", " ").replace(" ", "_")
+            if not src and getattr(d, "source", None):
+                src = str(getattr(d, "source")).lower()
+            if src == "fire" and nm in fire_classes:
+                fire_dets.append(d)
+
+        fire_active = bool(getattr(self, "ENABLE_FIRE_LOGGING", True)) and len(fire_dets) > 0
+        # Kapatıldıysa, bir önce açık idiyse flush (nazik kapanış)
+        prev_fire = getattr(self, "_fire_active_prev", None)
+        if prev_fire is True and fire_active is False:
+            try: self.fire_logger.flush()
+            except: pass
+        self._fire_active_prev = fire_active
+
+        if fire_active:
+            max_conf_fire = {"fire": 0.0, "smoke": 0.0}
+            for d in fire_dets:
+                parts = str(d.cls_name).split(":", 1)
+                nm = (parts[1] if len(parts)==2 else parts[0]).lower().replace("-", " ").replace(" ", "_")
+                c = float(d.conf)
+                if c > max_conf_fire[nm]:
+                    max_conf_fire[nm] = c
+            hazards = [k for k, v in max_conf_fire.items() if v > 0.0]
+            try:
+                self.fire_logger.process_frame(
+                    frame_id=int(cur_idx),
+                    frame_ts=time.time(),
+                    observations=[{
+                        "hazards": hazards,
+                        "conf": {k: v for k, v in max_conf_fire.items() if v > 0.0}
                     }]
                 )
             except Exception:
