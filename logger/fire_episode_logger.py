@@ -120,7 +120,7 @@ class FireEpisodeTracker:
         conf_max: Dict[str, float] = {}
         any_hazard = False
         for obs in observations or []:
-            hz = list(obs.get("hazards", []))
+            hz = list(obs.get("hazards", []))   
             if hz:
                 any_hazard = True
             for h in hz:

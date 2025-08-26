@@ -1,0 +1,206 @@
+# ===== Box Anomaly Episode Logger (JSONL + Görsel Kaydı) =====
+# Tek satır JSONL + epizot bitişinde görsel kanıt (crop veya full-frame) kaydı.
+# Kullanım:
+#   ep = BoxAnomalyEpisodeTracker(
+#           jsonl_path="logs/box_anomaly_episodes.jsonl",
+#           site="warehouse-C", camera_id="cam-03",
+#           evidence_delay_s=5.0, also_console=True,
+#           save_dir="logs/box_anom_images",
+#           save_mode="crop"   # "crop" | "frame" | "both"
+#       )
+#   ep.process_frame(frame_id=i, frame_ts=time.time(), anomalies=[{"bbox":[x1,y1,x2,y2],"score":s,"is_anomaly":True}], frame=frame_bgr)
+#   ...
+#   ep.flush()  # program kapanışında çağır (varsa açık epizotu kapatır)
+
+import os, json, time
+from typing import List, Dict, Optional
+
+import cv2
+import numpy as np
+
+
+class BoxAnomalyEpisodeTracker:
+    """
+    Any anomaly presence starts (or continues) an episode.
+    When there is no anomaly for >= evidence_delay_s, the episode closes and
+    a single JSONL record is written. Optionally saves an image as evidence.
+
+    anomalies: list of dicts like:
+      {"bbox":[x1,y1,x2,y2], "score":float, "is_anomaly":bool}
+    """
+
+    def __init__(self,
+                 jsonl_path: str,
+                 site: str,
+                 camera_id: str,
+                 evidence_delay_s: float = 5.0,
+                 also_console: bool = True,
+                 save_dir: Optional[str] = None,
+                 save_mode: str = "crop"  # "crop" | "frame" | "both"
+                 ):
+        self.jsonl_path = jsonl_path
+        os.makedirs(os.path.dirname(self.jsonl_path), exist_ok=True)
+
+        self.site = site
+        self.camera_id = camera_id
+        self.evidence_delay_s = float(evidence_delay_s)
+        self.also_console = also_console
+
+        self.save_dir = save_dir
+        self.save_mode = save_mode.lower().strip()
+        if self.save_dir:
+            os.makedirs(self.save_dir, exist_ok=True)
+
+        # durum
+        self.active = False
+        self.start_ts: Optional[float] = None
+        self.start_frame: Optional[int] = None
+        self.last_seen_ts: Optional[float] = None
+        self.latest_frame: Optional[int] = None
+
+        # istatistik
+        self.max_score: float = 0.0
+        self.hit_count: int = 0
+        self.sample_bbox: Optional[List[int]] = None  # en yüksek skora ait bbox
+
+        # görsel kanıt
+        self._best_frame_bgr: Optional[np.ndarray] = None  # en iyi skor görüldüğünde saklanan frame
+
+    # -------------- yardımcılar --------------
+    def _reset(self):
+        self.active = False
+        self.start_ts = None
+        self.start_frame = None
+        self.last_seen_ts = None
+        self.latest_frame = None
+        self.max_score = 0.0
+        self.hit_count = 0
+        self.sample_bbox = None
+        self._best_frame_bgr = None
+
+    def _safe_crop(self, img: np.ndarray, bbox: List[int]) -> Optional[np.ndarray]:
+        if img is None or bbox is None:
+            return None
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(w - 1, int(x1)))
+        y1 = max(0, min(h - 1, int(y1)))
+        x2 = max(0, min(w,     int(x2)))
+        y2 = max(0, min(h,     int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return img[y1:y2, x1:x2].copy()
+
+    def _save_evidence(self, start_ts: float, end_ts: float) -> Optional[str]:
+        """
+        Save image evidence according to save_mode.
+        Returns path (str) of a representative file if saved, else None.
+        """
+        if not self.save_dir or self._best_frame_bgr is None:
+            return None
+
+        start_id = int(start_ts)
+        end_id = int(end_ts)
+        base = f"episode_{start_id}_{end_id}"
+        saved_any = None
+
+        # crop
+        if self.save_mode in ("crop", "both") and self.sample_bbox is not None:
+            crop = self._safe_crop(self._best_frame_bgr, self.sample_bbox)
+            if crop is not None and crop.size > 0:
+                crop_path = os.path.join(self.save_dir, base + "_crop.jpg")
+                cv2.imwrite(crop_path, crop)
+                saved_any = crop_path
+
+        # full frame
+        if self.save_mode in ("frame", "both"):
+            frame_path = os.path.join(self.save_dir, base + "_frame.jpg")
+            cv2.imwrite(frame_path, self._best_frame_bgr)
+            if saved_any is None:
+                saved_any = frame_path
+
+        return saved_any
+
+    def _write_episode(self, end_ts: float, end_frame: int):
+        if self.start_ts is None:
+            return
+
+        rec = {
+            "type": "box_anomaly_episode",
+            "site": self.site,
+            "camera_id": self.camera_id,
+            "ts_start": float(self.start_ts),
+            "ts_end": float(end_ts),
+            "duration_s": float(max(0.0, end_ts - self.start_ts)),
+            "frame_start": int(self.start_frame),
+            "frame_end": int(end_frame),
+            "max_score": float(self.max_score),
+            "hit_count": int(self.hit_count),
+            "sample_bbox": self.sample_bbox,
+        }
+
+        # Görsel kanıtı kaydet (varsayılan: crop)
+        try:
+            img_path = self._save_evidence(self.start_ts, end_ts)
+            if img_path:
+                rec["sample_image"] = img_path
+        except Exception as e:
+            rec["sample_image_error"] = repr(e)
+
+        with open(self.jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        if self.also_console:
+            print("[BOX-ANOM EPISODE]", rec)
+
+    # -------------- ana API --------------
+    def process_frame(self,
+                      frame_id: int,
+                      frame_ts: float,
+                      anomalies: List[Dict],
+                      frame: Optional[np.ndarray] = None):
+        """
+        anomalies: [{"bbox":[x1,y1,x2,y2], "score":float, "is_anomaly":bool}, ...]
+        frame: BGR np.ndarray (isteğe bağlı; görsel kaydetmek için gerekir)
+        """
+        any_anom = any(bool(a.get("is_anomaly", False)) for a in anomalies)
+        self.latest_frame = int(frame_id)
+
+        # Anomali varsa epizodu başlat/sürdür ve istatistikleri güncelle
+        if any_anom:
+            if not self.active:
+                self.active = True
+                self.start_ts = float(frame_ts)
+                self.start_frame = int(frame_id)
+                self.max_score = 0.0
+                self.hit_count = 0
+                self.sample_bbox = None
+                self._best_frame_bgr = None
+
+            self.last_seen_ts = float(frame_ts)
+            self.hit_count += 1
+
+            # en yüksek skor ve örnek bbox + görsel
+            for a in anomalies:
+                if not a.get("is_anomaly", False):
+                    continue
+                sc = float(a.get("score", 0.0))
+                if sc >= self.max_score:
+                    self.max_score = sc
+                    bbox = a.get("bbox") or []
+                    self.sample_bbox = list(map(int, bbox)) if len(bbox) == 4 else None
+                    if frame is not None:
+                        self._best_frame_bgr = frame.copy()
+
+        # Epizodu kapatma (sessizlik >= evidence_delay_s)
+        if self.active and (self.last_seen_ts is not None):
+            if (frame_ts - self.last_seen_ts) >= self.evidence_delay_s:
+                self._write_episode(end_ts=self.last_seen_ts, end_frame=self.latest_frame or -1)
+                self._reset()
+
+    def flush(self):
+        """Uygulama kapanırken çağır: açık bir epizot varsa şimdi kapatır."""
+        if self.active:
+            now = time.time()
+            self._write_episode(end_ts=now, end_frame=self.latest_frame if self.latest_frame is not None else -1)
+            self._reset()

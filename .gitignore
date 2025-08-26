@@ -189,3 +189,5 @@ runs/
 train_code/
 datasets/
 logs/
+anomaly_data/
+results/
